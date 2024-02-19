@@ -1,0 +1,229 @@
+import sqlite3
+import requests
+from requests.auth import HTTPDigestAuth
+import xmltodict
+from datetime import datetime, timedelta
+import time
+import base64
+import requests
+#from torch import nn
+import ultralytics
+#from ultralytics import YOLO
+import re
+import os
+
+script_location = os.path.dirname(os.path.abspath(__file__))
+print(f"The exact location of this script is:\n{script_location}")
+
+CameraIP = "10.10.36.2"
+#CameraIP = "192.168.10.65"
+CameraUser = "admin"
+CameraPass = "TEKTRON@123"
+CameraServerURL = "http://10.10.24.224/Kashef/API/Kashef/VehicleLogs"
+
+class_mapping = {
+    0: "Blue",
+    1: "Green",
+    2: "White",
+    3: "Gray",
+    4: "Yellow"
+}
+
+model_file_path = os.path.join(script_location, 'best.pt')
+model = ultralytics.YOLO(model_file_path)
+print(model,type(model))
+print("Opened model successfully")
+
+db_file_path = os.path.join(script_location, 'records.db')
+conn = sqlite3.connect(db_file_path)
+print("Opened database successfully")
+
+
+conn.execute('''CREATE TABLE IF NOT EXISTS your_table_name (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captureTime TEXT,
+    plateNumber TEXT,
+    picName TEXT,
+    country TEXT,
+    laneNo INTEGER,
+    direction TEXT,
+    matchingResult TEXT);''')
+print("Table created successfully")
+
+def parse_plate_number(data):
+    numeric_part = ""
+    alphanumeric_part = ""
+    first_char = ""
+    second_char = ""
+    third_char = ""
+    match = re.match(r"(\d+)(\D+)", data)
+    if match:
+        try:
+            numeric_part = match.group(1)
+            alphanumeric_part = match.group(2)
+            first_char = alphanumeric_part[-3]
+            second_char = alphanumeric_part[-2]
+            third_char = alphanumeric_part[-1]
+        except:
+            numeric_part = data[:-3]
+            alphanumeric_part = data[-3:]
+            first_char = alphanumeric_part[-3]
+            second_char = alphanumeric_part[-2]
+            third_char = alphanumeric_part[-1]
+    else:
+        numeric_part = data[:-3]
+        alphanumeric_part = data[-3:]
+        first_char = alphanumeric_part[-3]
+        second_char = alphanumeric_part[-2]
+        third_char = alphanumeric_part[-1]
+    return numeric_part,alphanumeric_part,first_char,second_char,third_char
+
+def process_plate_using_ml(imageurl):
+    results = model.predict(source=imageurl, conf=0.25)
+    try:
+        print(results[0].boxes.cls,results[0].boxes.conf)
+        class_string = class_mapping.get(int(results[0].boxes.cls[0]), "Unknown") 
+        class_confidance = int(results[0].boxes.conf[0] * 100)
+        if(class_string == "White"):
+            plateType="1"
+        elif (class_string == "Yellow"):
+            plateType="2"
+        elif (class_string == "Blue"):
+            plateType="3"
+        elif (class_string == "Gray"):
+            plateType="8"
+        elif (class_string == "Green"):
+            plateType="9"
+        else:
+            plateType="1"
+        print(f"Class: {class_string}")
+        print(f"Confidence: {class_confidance} %")
+        print("--------------------")
+        return plateType,class_string,class_confidance
+    except:
+        return "1","White",0
+
+def send_new_record_server(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result):
+    if(country == "KSA"):
+        numeric_part,alphanumeric_part,first_char,second_char,third_char = parse_plate_number(plate_number)
+        print(numeric_part,alphanumeric_part,first_char,second_char,third_char)
+        imageurl = "http://" + CameraIP + "/doc/ui/images/plate/"+ pic_name+ ".jpg"
+        Base64Image = base64.b64encode(requests.get(imageurl).content)
+        plateType,class_string,class_confidance = process_plate_using_ml(imageurl)
+        print(class_string,class_confidance)
+        CaptureTimeStamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        Country = "Saudi Arabia"
+        PhotoB64 = Base64Image.decode('UTF-8')
+        BodyParams = {
+            "plateType":plateType, 
+            "plateNumber":numeric_part,
+            "plateEnLetter1":first_char,
+            "plateEnLetter2":second_char,
+            "plateEnLetter3":third_char,
+            "CameraIP":CameraIP,
+            "CaptureTimeStamp":CaptureTimeStamp,
+            "Country":Country,
+            "PhotoB64":PhotoB64,
+        }
+        Resp = requests.post(CameraServerURL, json = BodyParams,timeout=5)
+        print(Resp.text)
+    
+def insert_data_into_table1(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result):
+    # Connect to the SQLite database
+    conn = sqlite3.connect('records.db')
+    cursor = conn.cursor()
+    # Insert data into the table
+    query = "INSERT INTO your_table_name (captureTime, plateNumber, picName, country, laneNo, direction, matchingResult) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    values = (capture_time, plate_number, pic_name, country, lane_no, direction, matching_result)
+    cursor.execute(query, values)
+    # Commit changes and close the connection
+    conn.commit()
+    conn.close()
+
+def is_data_present_in_table(capture_time, plate_number, pic_name):
+    conn = sqlite3.connect('records.db')
+    cursor = conn.cursor()
+    query = "SELECT id FROM your_table_name WHERE captureTime = ? AND plateNumber = ? AND picName = ?"
+    values = (capture_time, plate_number, pic_name)
+    cursor.execute(query, values)
+    # Fetch the result
+    result = cursor.fetchone()
+    # Close the connection
+    conn.close()
+
+    # If there's a result (data exists), return True; otherwise, return False
+    return bool(result)
+
+def insert_data_into_table(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result):
+    # Check if data is already present in the table
+    data_exists = is_data_present_in_table(capture_time, plate_number, pic_name)
+    print("Data Exist : ", data_exists)
+    if not data_exists:
+        # Connect to the SQLite database
+        conn = sqlite3.connect('records.db')
+        cursor = conn.cursor()
+
+        # Insert data into the table
+        query = "INSERT INTO your_table_name (captureTime, plateNumber, picName, country, laneNo, direction, matchingResult) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        values = (capture_time, plate_number, pic_name, country, lane_no, direction, matching_result)
+        cursor.execute(query, values)
+
+        # Commit changes and close the connection
+        conn.commit()
+        conn.close()
+        print(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result)
+        send_new_record_server(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result)
+
+
+
+
+#for i in range(0,100):
+while True:
+    try:
+        now = datetime.now() - timedelta(days = 1)
+        date_time = now.strftime("%Y%m%dT%H%M%S")
+        print(date_time)
+        url = 'http://' + CameraIP + '/ISAPI/Traffic/channels/1/vehicleDetect/plates/'
+        data = "<AfterTime><picTime>"+date_time+"</picTime></AfterTime>"
+        r=requests.get(url, data =data,auth=HTTPDigestAuth(CameraUser, CameraPass),timeout=2)
+        if(r.status_code == 200):
+            data_dict = xmltodict.parse(r.text)
+            #print(data_dict)
+            intx = 0
+            #print(len(data_dict["Plates"]["Plate"]))
+            try:
+                value = isinstance(data_dict["Plates"]["Plate"], dict)
+                print("Value found:", value)
+            except KeyError:
+                data_dict["Plates"]["Plate"] = None
+                print("Details not found.")
+
+            if isinstance(data_dict["Plates"]["Plate"], dict):
+                print(data_dict["Plates"]["Plate"])
+                capture_time = data_dict["Plates"]["Plate"]["captureTime"]
+                plate_number = data_dict["Plates"]["Plate"]["plateNumber"]
+                pic_name = data_dict["Plates"]["Plate"]["picName"]
+                country = data_dict["Plates"]["Plate"]["country"]
+                lane_no = data_dict["Plates"]["Plate"]["laneNo"]
+                direction = data_dict["Plates"]["Plate"]["direction"]
+                matching_result = data_dict["Plates"]["Plate"]["matchingResult"]
+                insert_data_into_table(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result)
+            elif isinstance(data_dict["Plates"]["Plate"], list):
+                i = len(data_dict["Plates"]["Plate"])-1
+                print(data_dict["Plates"]["Plate"][i])
+                capture_time = data_dict["Plates"]["Plate"][i]["captureTime"]
+                plate_number = data_dict["Plates"]["Plate"][i]["plateNumber"]
+                pic_name = data_dict["Plates"]["Plate"][i]["picName"]
+                country = data_dict["Plates"]["Plate"][i]["country"]
+                lane_no = data_dict["Plates"]["Plate"][i]["laneNo"]
+                direction = data_dict["Plates"]["Plate"][i]["direction"]
+                matching_result = data_dict["Plates"]["Plate"][i]["matchingResult"]
+                insert_data_into_table(capture_time, plate_number, pic_name, country, lane_no, direction, matching_result)
+            else:
+                print("No Plates")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("Quitting")
+        exit()
+    except Exception as e:
+        print('Exception:',e,'\n')
